@@ -1,0 +1,686 @@
+//by GreenGianT 2004
+
+//*********************//
+// includes            //
+//**********************************************************************
+
+#include <gba.h>		//GBA register definitions
+#include <dispcnt.h>		//REG_DISPCNT register #defines
+#include <dma.h>
+#include <keypad.h>      	//gba button registers
+#include <sprites.h>		//sprite definitions
+#include <bg.h>                 //backgrounds
+#include <2d.h>
+#include <rand.h>
+
+#include <interruptTable.h>
+#include <interrupts.h>
+
+#include <boolean.h>            //a BOOL datatype (TRUE/FALSE)
+
+#include <collision.h>
+#include <gfxData.h>
+
+#define WAIT_FOR_VSYNC while((volatile u16)REG_VCOUNT != 160){}
+
+
+//*********************//
+// CONSTANTS           //
+//**********************************************************************
+
+//SCORE STUFF
+
+#define SCORE_LABEL_SPRITE  0   //sprite numbers
+#define SCORE_DIGIT_SPRITE1 1
+#define SCORE_DIGIT_SPRITE2 2
+
+#define SCORE_X 207             //location of score on screen
+#define SCORE_Y 0
+
+
+#define FIRST_SHOT_SPRITE   3
+#define MAX_SHOTS 9
+
+#define FIRST_ALIEN_SPRITE  3 + MAX_SHOTS
+#define MAX_ALIENS 9
+#define ALIEN_WAIT_TIME 150
+
+#define SCORE_LABEL_TILENUM  512
+#define ZERO_TILENUM         528
+#define SHOT_FRAME1_TILENUM  608
+#define ALIEN1_FRAME1        736       //TILENUMBERS for the alien sprites
+
+
+//*********************//
+// STRUCTS             //
+//**********************************************************************
+
+struct game_s {
+  u8 level;
+  u8 score;
+} game;
+
+struct alien_s {
+  enum BOOL alive;
+  s16 x, y;             //screen coords
+  s16 destX, destY;     //destination coords for when an alien is moving
+  u8 crater;            //what crater the alien is on/ moving to
+  enum BOOL moving;     //is the alien moving, if not then it is waiting
+  u16 waiting;          //how many frames the alien has been "waiting" above a crater
+  u8 spriteNum;         //indexes the sprites array
+  s8 frames;            //-1 for not animated
+  u8 frameNum;          //current frame number
+} aliens [MAX_ALIENS];
+
+struct shot_s {
+  enum BOOL alive;
+  s16 x, y;
+  s16 destX, destY;
+  s8 frames;
+  u8 frameNum;
+  u8 spriteNum;
+} shots [MAX_SHOTS];
+
+
+//*********************//
+// function prototypes //
+//**********************************************************************
+
+void getInput (void);
+void doTitlescreen (void);
+void loadSprites (void);
+
+void newGame (void);
+
+void loadLevel (u8 level);
+void drawHUD (void);
+void updateScore (u8 score);
+
+void doCollision (void);
+
+void initShots (void);
+void newShot (s16 targetX, s16 targetY);
+void moveShots (void);
+
+void initAliens (void);
+void newAlien (void);
+void sortAliens (void);
+void moveAliens (void);
+void getNextPosition (s16 x, s16 y, s16 x2, s16 y2, s16 *newX, s16 *newY);
+void animate (void);
+
+
+//*********************//
+// GLOBALS VARS        //
+//**********************************************************************
+
+enum BOOL upLock = FALSE, downLock = FALSE, leftLock = FALSE, rightLock = FALSE, aLock = FALSE, bLock = FALSE, lLock = FALSE, rLock = FALSE, startLock = FALSE, selectLock = FALSE;
+
+//crater co-ords so the aliens know where to move to and when to fire your shot.  different for each level
+s16 CRATERS[9][2] = { {62,85}, {126,85}, {192,87}, {28,100}, {134,108}, {218,104}, {43,128}, {107,142}, {176,128} };
+
+//collision boxes
+//for aliens use CBOX[levelNum-1] for the aliens
+//for shots use CBOX[shot[currentShot].frame]
+
+u8 SHOT_CBOX[4][4] = {
+{10,22,10,22},
+{8,24,8,24},
+{8,24,8,24},
+{8,24,8,24}
+};
+
+u8 ALIEN_CBOX[6][4] = {
+  {15,49,1,29},
+  {0,64,0,32},
+  {0,64,0,32},
+  {0,64,0,32},
+  {0,64,0,32},
+  {0,64,0,32}
+};
+
+u8 CURRENTSHOTS = 0;
+
+extern u16 *theVideoBuffer;
+extern u32 FRAMECOUNT;
+extern u8 DRAWSPRITES;
+
+u16 ALIEN_FIRSTTILE = ALIEN1_FRAME1;   //update ALIEN_FIRST_TILE on a level change
+
+
+//*********************//
+// MAIN PROGRAM        //
+//**********************************************************************
+
+int main (void) {
+  u8 score = 0;
+  u16 bing = 0;
+
+  enableInterrupts (INT_VBLANK);
+
+  SetMode (MODE_4 | OBJ_ENABLE | OBJ_MAP_1D | BG2_ENABLE);
+ 
+  doTitlescreen ();
+  loadSprites ();
+
+
+  newGame ();
+  loadLevel (1);
+
+  initSprites ();    //put these two lines into "loadLevel ()"
+
+  drawHUD ();
+  initAliens ();
+
+  newAlien ();
+  newAlien ();
+  newAlien ();
+
+  while (1) {
+    //WAIT_FOR_VSYNC;
+    for (bing = 0; bing < 3000; bing++) ;   //just a hack for some delay
+
+    moveShots ();
+    moveAliens ();
+    animate ();
+
+    if (CURRENTSHOTS > 0)
+      doCollision ();
+
+    updateScore (score++);
+    if (score == 100)
+      score = 0;
+
+    getInput ();
+  }
+
+  exit (0);
+}
+
+
+
+//**********************//
+// FUNCTION DEFINITIONS //
+//**********************************************************************
+
+// ** handle user input **
+
+void getInput (void) {  
+  if (!(*KEYS & KEY_UP) && upLock == FALSE) {        //** DPAD
+    upLock = TRUE;
+    newShot (CRATERS[1][0], CRATERS[1][1]);
+  }
+
+  if (*KEYS & KEY_UP) upLock = FALSE;
+  
+
+  if (!(*KEYS & KEY_DOWN) && downLock == FALSE) {
+    downLock = TRUE;
+    newShot (CRATERS[7][0], CRATERS[7][1]);
+  }
+  
+  if (*KEYS & KEY_DOWN) downLock = FALSE;
+
+
+  if (!(*KEYS & KEY_LEFT) && leftLock == FALSE) {
+    leftLock = TRUE;
+    newShot (CRATERS[3][0], CRATERS[3][1]);
+  }
+
+  if (*KEYS & KEY_LEFT) leftLock = FALSE;
+
+  
+  if (!(*KEYS & KEY_RIGHT) && rightLock == FALSE) {
+    rightLock = TRUE;
+    newShot (CRATERS[5][0], CRATERS[5][1]);
+  }
+
+  if (*KEYS & KEY_RIGHT) rightLock = FALSE;
+  
+
+  if(!(*KEYS & KEY_A) && aLock == FALSE) {          //** A and B
+    aLock = TRUE;
+    newShot (CRATERS[2][0], CRATERS[2][1]);
+  }
+
+  if (*KEYS & KEY_A) aLock = FALSE;
+
+
+  if(!(*KEYS & KEY_B) && bLock == FALSE) {
+    bLock = TRUE;
+    newShot (CRATERS[0][0], CRATERS[0][1]);
+  }
+
+  if (*KEYS & KEY_B) bLock = FALSE;
+
+  
+  if(!(*KEYS & KEY_L) && lLock == FALSE) {          //** SHOULDER BUTTONS
+    lLock = TRUE;
+    newShot (CRATERS[6][0], CRATERS[6][1]);
+  }
+
+  if (*KEYS & KEY_L) lLock = FALSE;
+  
+
+  if(!(*KEYS & KEY_R) && rLock == FALSE) {
+    rLock = TRUE;
+    newShot (CRATERS[8][0], CRATERS[8][1]);
+  }
+
+  if (*KEYS & KEY_R) rLock = FALSE;
+
+
+  if(!(*KEYS & KEY_START) && startLock == FALSE) {     //** START
+    startLock = TRUE;
+    newShot (CRATERS[4][0], CRATERS[4][1]);
+  }
+
+  if (*KEYS & KEY_START) startLock = FALSE;
+
+
+  if(!(*KEYS & KEY_SELECT) && selectLock == FALSE) {    //** SELECT
+    selectLock = TRUE;
+  }
+
+  if (*KEYS & KEY_SELECT) selectLock = FALSE;
+}
+
+
+//doTitlescreen ()
+//fade in the titlescreen, wait for a keypress, then fade out
+
+void doTitlescreen (void) {
+  drawBG ((u16*)titlescreenPalette, (u16*)titlescreen);
+  flip ();
+
+  while (*KEYS & KEY_START) { WAIT_FOR_VSYNC; }
+  while (!(*KEYS & KEY_START)) { WAIT_FOR_VSYNC; }
+  
+}
+
+
+//loadSprites ()
+//load the sprite palette and put the sprite data into OAMData
+
+void loadSprites (void) {
+  int posn = 16384;
+ 
+  DMA_Copy (3, (void *)OBJPaletteMem, (void *)spritePalette, 128, DMA_32NOW);   //load palette
+
+  LZ77UnCompVRAM ((void *)scoreData, (void *)OAMData + posn);                    //load sprites
+  posn += 32 * 16;
+  LZ77UnCompVRAM ((void *)numsData, (void *)OAMData + posn);
+  posn += 16 * 160;
+  LZ77UnCompVRAM ((void *)shotData, (void *)OAMData + posn);
+  posn += 32 * 128;
+  LZ77UnCompVRAM ((void *)alien1_1, (void *)OAMData + posn);                    
+}
+
+
+//newGame ()
+//init the game struct with level and score info
+
+void newGame (void) {
+  game.level = 1;
+  game.score = 0;
+}
+
+
+//loadLevel ()
+//loads a new bg image for the given level
+
+void loadLevel (u8 level) {
+  switch (level) {
+  case 1: {
+    drawBG ((u16*)level1Palette, (u16*)level1);
+    flip ();
+
+    ALIEN_FIRSTTILE = ALIEN1_FRAME1;
+    break;
+  }
+  }
+}
+
+
+//drawHUD ()
+//draw the score label and score of 00
+
+void drawHUD (void) {
+  sprites[SCORE_LABEL_SPRITE].attribute0 = COLOR_256 | TALL | SCORE_Y;
+  sprites[SCORE_LABEL_SPRITE].attribute1 = SIZE_32 | SCORE_X - 32;
+  sprites[SCORE_LABEL_SPRITE].attribute2 = SCORE_LABEL_TILENUM;
+
+  sprites[SCORE_DIGIT_SPRITE1].attribute0 = COLOR_256 | SQUARE | SCORE_Y;
+  sprites[SCORE_DIGIT_SPRITE1].attribute1 = SIZE_16 | SCORE_X;
+
+  sprites[SCORE_DIGIT_SPRITE2].attribute0 = COLOR_256 | SQUARE | SCORE_Y;
+  sprites[SCORE_DIGIT_SPRITE2].attribute1 = SIZE_16 | SCORE_X + 16;
+
+  updateScore (0);
+}
+
+
+//updateScore ()
+//draw/redraw the score
+
+void updateScore (u8 score) {
+  u8 tens = 0, units = 0;
+  u8 i = score;
+ 
+  while (i >= 10) {
+    tens++;
+    i -= 10;
+  }
+  
+  if ((i > 0) && (i < 10))
+    units = i; 
+    
+  sprites[SCORE_DIGIT_SPRITE1].attribute2 = ZERO_TILENUM + (8 * tens);
+  sprites[SCORE_DIGIT_SPRITE2].attribute2 = ZERO_TILENUM + (8 * units);
+
+  DRAWSPRITES = TRUE;
+}
+
+
+//checkCollisions ()
+//check through all shots and all aliens to see if there has been a collision, if so deal with it.
+void doCollision (void) {
+  u8 alien, shot;
+
+  for (alien = 0; alien < MAX_ALIENS; alien++) {
+    if (aliens[alien].alive == TRUE) {
+      for (shot = 0; shot < MAX_SHOTS; shot++) {
+	if (shots[shot].alive == TRUE) {
+	  if (checkSpriteCollision (ALIEN_CBOX[game.level-1], aliens[alien].x, aliens[alien].y, SHOT_CBOX[shots[shot].frameNum], shots[shot].x, shots[shot].y) == TRUE)
+	    while (*KEYS & KEY_START) {WAIT_FOR_VSYNC;};               //FREEZE!
+	}
+      }
+    }
+  }
+}
+
+
+//initShots ()
+//initialises the shots array
+
+void initShots (void) {
+  u8 i;
+  
+  for (i = 0; i < MAX_SHOTS; i++) {
+    shots[i].alive = FALSE;
+  }
+}
+
+
+//newShot ()
+//fire a new shot at the given target X and Y
+
+void newShot (s16 targetX, s16 targetY) {
+  u8 i;
+  
+  for (i = 0; i < MAX_SHOTS; i++) {
+    if (shots[i].alive == FALSE) {
+      shots[i].alive = TRUE;
+      shots[i].x = 104;
+      shots[i].y = 128;
+      shots[i].destX = targetX - 16;
+      shots[i].destY = targetY - 32;
+      shots[i].frames = 4;
+      shots[i].frameNum = 0;
+      shots[i].spriteNum = FIRST_SHOT_SPRITE + i;
+
+      sprites[shots[i].spriteNum].attribute0 = COLOR_256 | SQUARE | shots[i].y;
+      sprites[shots[i].spriteNum].attribute1 = SIZE_32 | shots[i].x;
+      sprites[shots[i].spriteNum].attribute2 = SHOT_FRAME1_TILENUM;
+
+      DRAWSPRITES = TRUE;
+
+      CURRENTSHOTS++;
+
+      return;
+    }
+  }
+}
+
+
+//moveShots ()
+//moves all the shots to their next position
+
+void moveShots (void) {
+  u8 i;
+
+  for (i = 0; i < MAX_SHOTS; i++) {
+    if (shots[i].alive == TRUE) {
+      getNextPosition (shots[i].x, shots[i].y, shots[i].destX, shots[i].destY, &shots[i].x, &shots[i].y);
+      if (shots[i].y < shots[i].destY+5) {
+	shots[i].alive = FALSE;
+	turnOffSprite (&sprites[shots[i].spriteNum]);
+	CURRENTSHOTS--;
+      }
+      else
+	moveSprite (&sprites[shots[i].spriteNum], shots[i].x, shots[i].y);
+
+      DRAWSPRITES = TRUE;
+    }
+  }
+}
+
+
+//initAliens ()
+//make sure the aliens array is initialised
+
+void initAliens (void) {
+  u8 i;
+
+  for (i = 0; i < MAX_ALIENS; i++) {
+    aliens[i].alive = FALSE;
+  }
+}
+
+
+//newAlien ()
+//create a new alien and place it on the screen
+
+void newAlien (void) {
+  u8 i, j, crater;
+  enum BOOL NEWCRATER;
+
+  for (i = 0; i < MAX_ALIENS; i++) {
+    if (aliens[i].alive == FALSE) {
+      aliens[i].alive = TRUE;
+     
+      do {
+	crater = rand (99) * 3 - 0.5;
+	NEWCRATER = TRUE;
+
+	for (j = 0; j < MAX_ALIENS && NEWCRATER == TRUE; j++) {
+	  if ((j != i) && (aliens[j].alive == TRUE))
+	    if (aliens[j].crater == crater)
+	      NEWCRATER = FALSE;
+	}
+      } while (NEWCRATER == FALSE);
+
+      aliens[i].x = CRATERS[crater][0] - 32;
+      aliens[i].y = CRATERS[crater][1] - 32;                //screen coords
+
+      aliens[i].crater = crater;                          //set the crater to the alien index (NOT AVAILABLE)
+      
+      aliens[i].moving = FALSE;
+      aliens[i].waiting = 0;
+      aliens[i].spriteNum = i + FIRST_ALIEN_SPRITE;
+      aliens[i].frames = -1;
+      aliens[i].frameNum = 0;
+      
+      sprites[aliens[i].spriteNum].attribute0 = COLOR_256 | TALL | aliens[i].y;
+      sprites[aliens[i].spriteNum].attribute1 = SIZE_64 | aliens[i].x;
+      sprites[aliens[i].spriteNum].attribute2 = ALIEN_FIRSTTILE;
+
+      DRAWSPRITES = TRUE;
+      
+      return;
+    }    
+  }
+}
+
+
+//sortAliens ()
+//sort the aliens so that the sprite priority is correct, sort by the y value.  the lower the y value the further back the sprite
+
+void sortAliens (void) {
+  u8 i, j, numOfAliens = 0, tempSpriteNum;
+  u8 alienIndex[9];
+  u8 spriteNums[9];
+  struct alien_s tempAlien;
+  
+  for (i = 0; i < MAX_ALIENS; i++) {
+    if (aliens[i].alive == TRUE)
+      spriteNums[numOfAliens] = aliens[i].spriteNum;
+      alienIndex[numOfAliens++] = i;
+  }
+
+  for (j = 0; j < numOfAliens; j++) { 
+    for (i = 0; i < numOfAliens -1; i++) {
+      if (aliens[alienIndex[i+1]].y > aliens[alienIndex[i]].y) {
+	tempAlien = aliens[alienIndex[i]];
+	aliens[alienIndex[i]] = aliens[alienIndex[i+1]];
+	aliens[alienIndex[i+1]] = tempAlien;
+      }
+    }
+  }
+
+  for (j = 0; j < numOfAliens; j++) {
+    for (i=0; i < numOfAliens -1; i++) {
+      if (spriteNums[i+1] > spriteNums[i]) {
+	tempSpriteNum = spriteNums[i];
+	spriteNums[i] = spriteNums[i+1];
+	spriteNums[i+1] = tempSpriteNum;
+      }
+    }
+  }
+
+  for (i = 0; i < numOfAliens; i++) {
+    aliens[alienIndex[i]].spriteNum = spriteNums[i];
+  }
+}
+
+
+//moveAliens ()
+//move aliens along their current path
+//if an alien get to the front of the screen its gameover
+
+void moveAliens (void) {
+  u8 i, j, newCrater;
+  enum BOOL NEWCRATER;
+
+  for (i = 0; i < MAX_ALIENS; i++) {
+    if ((aliens[i].alive == TRUE) && (aliens[i].moving == TRUE)) {
+      getNextPosition (aliens[i].x, aliens[i].y, aliens[i].destX, aliens[i].destY, &aliens[i].x, &aliens[i].y);
+      moveSprite (&sprites[aliens[i].spriteNum], aliens[i].x, aliens[i].y);
+      //      DRAWSPRITES = TRUE;
+      if ((aliens[i].x == aliens[i].destX) || (aliens[i].y == aliens[i].destY))
+	aliens[i].moving = FALSE;
+    }
+    else
+      if (aliens[i].moving == FALSE) {
+	aliens[i].waiting++;
+	if (aliens[i].waiting > ALIEN_WAIT_TIME) {
+	  aliens[i].waiting = 0;
+	  aliens[i].moving = TRUE;
+	  
+	  do {                                              //choose a crater thats not already taken
+	    newCrater = rand (FRAMECOUNT % 99) * 9;
+	    if (newCrater == 9) newCrater--;
+	    NEWCRATER = TRUE;
+
+	    for (j = 0; j < MAX_ALIENS && NEWCRATER == TRUE; j++) {
+	      if (aliens[j].alive == TRUE)
+		if (aliens[j].crater == newCrater)
+		  NEWCRATER = FALSE;
+	    }
+	  } while (NEWCRATER == FALSE);
+
+	  aliens[i].destX = CRATERS[newCrater][0] - 32;
+	  aliens[i].destY = CRATERS[newCrater][1] - 32;
+
+	  aliens[i].crater = newCrater;
+	}	  
+      }
+  }
+
+  sortAliens ();
+  DRAWSPRITES = TRUE;
+}
+
+
+//getNextPosition ()
+//returns the next x,y along a line from x,y to x2, y2
+
+void getNextPosition (s16 x, s16 y, s16 x2, s16 y2, s16 *newX, s16 *newY) {
+  int i;
+  int steep = 1;
+  int sx, sy;  /* step positive or negative (1 or -1) */
+  int dx, dy;  /* delta (difference in X and Y between points) */
+  int e;
+  int bing = 0;
+
+  /* * inline swap. On some architectures, the XOR trick may be faster */
+  
+  int tmpswap;
+  #define SWAP(a,b) tmpswap = a; a = b; b = tmpswap;
+
+  /* * optimize for vertical and horizontal lines here */
+
+  dx = abs(x2 - x);
+  sx = ((x2 - x) > 0) ? 1 : -1;
+  dy = abs(y2 - y);
+  sy = ((y2 - y) > 0) ? 1 : -1;
+
+  if (dy > dx) {
+    steep = 0;
+    SWAP (x, y);
+    SWAP (dx, dy);
+    SWAP (sx, sy);
+  }
+
+  e = (dy << 1) - dx;
+
+  for (i = 0; i < dx; i++) {
+    if (steep) { 
+      if (bing == 1) {
+	//printf ("%d, %d\n", x, y);
+	*newX = x;
+	*newY = y;
+	return;
+      }
+    } 
+    else { 
+      if (bing == 1) {
+	//printf ("%d, %d\n", y, x);
+	*newX = y;
+	*newY = x;
+	return;
+      }
+    }
+
+    bing++;
+
+    while (e >= 0) { 
+      y += sy;
+      e -= (dx << 1);
+    }
+
+    x += sx;
+    e += (dy << 1);
+  }
+}
+
+
+
+//animate ()
+//check frame counter, update animated sprites on every nth frame
+
+void animate (void) {
+  //if FRAMECOUNT % 5 then ANIMATE == TRUE
+  //if ANIMATE == TRUE then increment frame number of everything thats animated
+  //set ANIMATE back to FALSE
+}
